@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>Árvore de Requisitos — Sistema IoT Monitoramento de Frotas</title>
+<style>
+  body { margin: 0; font-family: Arial, sans-serif; background: #f8fafc; }
+  h1 { text-align: center; padding: 16px; margin: 0; font-size: 18px; color: #1e293b; background: #fff; border-bottom: 1px solid #e2e8f0; }
+  #diagram { width: 100%; overflow: auto; padding: 24px; box-sizing: border-box; }
+  .mermaid { display: flex; justify-content: center; }
+  p.note { text-align: center; color: #64748b; font-size: 13px; margin: 0; padding: 8px; }
+</style>
+</head>
+<body>
+<h1>Árvore de Requisitos do Sistema — Projeto IoT Monitoramento de Frotas (USP/Poli)</h1>
+<p class="note">Use scroll / pinch para navegar. Abra em tela cheia para melhor visualização.</p>
+<div id="diagram">
+<pre class="mermaid">
+---
+config:
+  layout: dagre
+---
+flowchart TB
+    O1["Otimizar Transporte Público<br>via Monitoramento de Lotação"]
+
+    O1 --> CatF["Requisitos Funcionais<br>peso: 0,65"]
+    O1 --> CatN["Requisitos Não Funcionais<br>peso: 0,35"]
+
+    CatF --> SF["Sensoriamento<br>e Detecção"]
+    SF --> RF01["RF-01: Detectar Fluxo<br>Entrada/saída por porta<br>Precisão ≥ 90%<br>▪ Mandatório"]
+    SF --> RF02["RF-02: Estimar Ocupação<br>Contagem em tempo real<br>Erro máx. ±3 passageiros<br>▪ Mandatório"]
+    SF --> RF08["RF-08: Rastreio Individual<br>ID temporário anônimo<br>Criado no embarque, descartado no desembarque<br>▪ Mandatório"]
+    RF08 --> RF08a["Object Tracking<br>Rastreio físico contínuo no frame"]
+    RF08 --> RF08b["Re-ID local<br>Associação sem reconhecimento facial"]
+
+    CatF --> PR["Processamento<br>Embarcado"]
+    PR --> RF09["RF-09: Edge Computing<br>Inferência local no módulo<br>Sem envio de vídeo bruto<br>▪ Mandatório"]
+    PR --> RF10["RF-10: Modelo de Visão<br>Detecção + tracking em ≤ 200 ms/frame<br>Framework: YOLO ou equivalente<br>▪ Mandatório"]
+
+    CatF --> CM["Comunicação<br>e Transmissão"]
+    CM --> RF11["RF-11: Transmissão de Dados<br>Protocolo a definir (4G, LoRa, Wi-Fi, etc.)<br>Latência envio ≤ 30 s<br>▪ Mandatório"]
+    CM --> RF12["RF-12: Protocolo de Aplicação<br>MQTT ou HTTPS-REST<br>Payload JSON ≤ 1 KB/evento<br>▪ Mandatório"]
+    CM --> RF13["RF-13: Buffer Offline<br>Armazenamento local ≥ 2 h<br>em caso de perda de sinal<br>▪ Mandatório"]
+
+    CatF --> GE["Geolocalização"]
+    GE --> RF03["RF-03: Associar Ocupação ao GPS<br>Via API Olho Vivo (posição do veículo)<br>Resolução ≤ 50 m<br>▪ Mandatório"]
+    GE --> RF04["RF-04: Histórico por Ponto<br>Registrar embarque/desembarque<br>por parada identificada<br>▪ Mandatório"]
+
+    CatF --> IN["Integração<br>com Sistemas"]
+    IN --> RF07["RF-07: API Olho Vivo<br>Consulta de posição e linhas<br>Polling ≤ 60 s<br>▪ Mandatório"]
+    IN --> RF14["RF-14: Backend em Nuvem<br>Recepção, armazenamento e<br>agregação dos dados<br>◦ Opcional"]
+    IN --> RF15["RF-15: APIs Complementares<br>GTFS, clima, calendário<br>◦ Opcional"]
+
+    CatF --> UI["Interface<br>com Usuário"]
+    UI --> RF06["RF-06: Dashboard Web<br>Mapas de calor, gráficos, relatórios<br>Atualização ≤ 60 s<br>◦ Opcional"]
+    UI --> RF05["RF-05: Tempos de Viagem<br>Média por trecho exibida no painel<br>◦ Opcional"]
+
+    CatN --> AL["Alimentação<br>e Autonomia"]
+    AL --> RNF06["RNF-06: Alimentação<br>12 V DC via barramento do ônibus<br>Consumo ≤ 25 W<br>▪ Mandatório"]
+    AL --> RNF07["RNF-07: Autonomia<br>Buffer ≥ 30 min com motor desligado<br>(supercap ou bateria auxiliar)<br>▪ Mandatório"]
+    AL --> RNF08["RNF-08: Cabeamento Permitido<br>Conexão cabeada à rede elétrica<br>do veículo é viável<br>▪ Mandatório"]
+
+    CatN --> DM["Tamanho Físico<br>e Peso"]
+    DM --> RNF09["RNF-09: Dimensões<br>Módulo ≤ 200 × 150 × 80 mm<br>▪ Mandatório"]
+    DM --> RNF10["RNF-10: Peso<br>≤ 2 kg (módulo completo)<br>▪ Mandatório"]
+
+    CatN --> CU["Custo"]
+    CU --> RNF11["RNF-11: Custo de Materiais<br>≤ R$ 5.000 total (protótipo)<br>▪ Mandatório"]
+
+    CatN --> CO["Confiabilidade e<br>Resistência Ambiental"]
+    CO --> RNF04["RNF-04: Disponibilidade<br>Uptime ≥ 90% em operação<br>▪ Mandatório"]
+    CO --> RNF12["RNF-12: Temperatura<br>Operação entre 0 °C e 60 °C<br>▪ Mandatório"]
+    CO --> RNF13["RNF-13: Proteção<br>IP54 (poeira e respingos)<br>Resistência a vibração veicular<br>▪ Mandatório"]
+
+    CatN --> PV["Privacidade<br>e LGPD"]
+    PV --> RNF03["RNF-03: Anonimização<br>Sem armazenamento de imagens<br>IDs descartados no desembarque<br>▪ Mandatório"]
+    PV --> RNF14["RNF-14: Conformidade LGPD<br>Sem dado pessoal identificável<br>em trânsito ou em repouso<br>▪ Mandatório"]
+
+    CatN --> ES["Escalabilidade"]
+    ES --> RNF02["RNF-02: Replicabilidade<br>Hardware comercial (COTS)<br>Instalação ≤ 2 h/veículo<br>▪ Mandatório"]
+    ES --> RNF05["RNF-05: Interoperabilidade<br>Protocolos abertos (MQTT, REST, GTFS)<br>▪ Mandatório"]
+
+    class O1 objective
+    class CatF,CatN category
+    class SF,PR,CM,GE,IN,UI,AL,DM,CU,CO,PV,ES subcategory
+    class RF01,RF02,RF03,RF04,RF07,RF08,RF08a,RF08b,RF09,RF10,RF11,RF12,RF13 mandatory
+    class RF05,RF06,RF14,RF15 optional
+    class RNF02,RNF03,RNF04,RNF05,RNF06,RNF07,RNF08,RNF09,RNF10,RNF11,RNF12,RNF13,RNF14 nonfunc
+
+    classDef objective fill:#f9a8d4,stroke:#9333ea,stroke-width:3px,color:#000
+    classDef category fill:#bfdbfe,stroke:#1d4ed8,stroke-width:2px,color:#000
+    classDef subcategory fill:#dbeafe,stroke:#3b82f6,stroke-width:1.5px,color:#000
+    classDef mandatory fill:#bbf7d0,stroke:#15803d,stroke-width:2px,color:#000
+    classDef optional fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#000,stroke-dasharray:5 5
+    classDef nonfunc fill:#fde68a,stroke:#b45309,stroke-width:2px,color:#000
+</pre>
+</div>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, securityLevel: 'loose', flowchart: { useMaxWidth: false } });
+</script>
+</body>
+</html>
