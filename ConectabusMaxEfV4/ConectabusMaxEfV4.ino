@@ -180,6 +180,10 @@ IPAddress STA_DNS(10,10,115,1);
 #define BATT_DIVIDER              2.0f    // (R1+R2) / R2
 // ===========================================================
 
+// [G] Resultado do arme do PN532. Fica aqui no topo porque a Arduino IDE
+// gera os prototipos das funcoes antes do resto do codigo.
+enum ArmResult { ARM_IDLE, ARM_CARD, ARM_FAIL };
+
 // Entrada do buffer (na RTC memory)
 typedef struct {
   uint64_t ts_ms;
@@ -428,8 +432,6 @@ bool parseUidFromResponse(const uint8_t *b, int n, String &uidOut) {
   }
   return false;
 }
-
-enum ArmResult { ARM_IDLE, ARM_CARD, ARM_FAIL };
 
 /*
  * [G] Arma o PN532 e confere que da pra dormir:
