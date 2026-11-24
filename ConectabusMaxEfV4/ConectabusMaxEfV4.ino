@@ -29,6 +29,16 @@
  *       Pino fica travado em LOW durante o deep sleep (nao apita
  *       nem gasta corrente dormindo).
  *
+ *   [F] SINAIS DE LED + BUZZER (iguais ao TesteHardware):
+ *    - Ao ligar: 1 bip + 1 piscada longa  -> LED e buzzer OK
+ *    - PN532 encontrado: 2 bips curtos
+ *    - PN532 NAO encontrado: 3 bips graves e tenta de novo a cada 3s
+ *      (depois de PN532_FAST_RETRIES tentativas, passa a cada 30s
+ *      para nao gastar a bateria)
+ *    - Cartao lido: bip + piscada
+ *    Os sinais de "ligou" e "PN532 encontrado" so tocam ao ligar ou
+ *    apertar RESET, nao a cada vez que acorda do deep sleep.
+ *
  *  Mantido da V31: InAutoPoll (campo RF em duty-cycle), envio em
  *  lote, NTP so quando precisa, wake por IRQ do PN532, 80 MHz.
  *
@@ -81,6 +91,8 @@ const char* NTP_SERVER = "pool.ntp.org";
 #define BUZZER_PASSIVE   1
 #define BUZZER_FREQ_HZ   2700   // so p/ passivo
 #define BUZZER_MS        100    // duracao do bip
+#define BUZZER_LOW_HZ    800    // tom grave do sinal de erro (so p/ passivo)
+#define PN532_FAST_RETRIES 10   // [F] tentativas a cada 3s antes de passar a 30s
 
 #define MAX_BUFFERED_TAPS         64
 #define CONNECT_TOTAL_TIMEOUT_MS  30000   // hard reset apos isso
@@ -145,6 +157,7 @@ RTC_DATA_ATTR uint32_t tapsTotalSent   = 0;
 RTC_DATA_ATTR uint32_t bufferCount     = 0;
 RTC_DATA_ATTR uint64_t lastNtpSyncMs   = 0;
 RTC_DATA_ATTR uint32_t tbIpCache       = 0;   // [A] IP do servidor ja resolvido (0 = nao sei)
+RTC_DATA_ATTR uint32_t pn532FailCount  = 0;   // [F] falhas seguidas do PN532
 RTC_DATA_ATTR TapEntry tapBuffer[MAX_BUFFERED_TAPS];
 
 HardwareSerial mySerial(1);
@@ -189,10 +202,10 @@ String uidToString(uint8_t *uid, uint8_t len) {
   return s;
 }
 
-// [E] Bip curto de "cartao lido"
-void beep(int ms = BUZZER_MS) {
+// [E] Bip (freq so vale para buzzer passivo)
+void beep(int ms = BUZZER_MS, int freq = BUZZER_FREQ_HZ) {
 #if BUZZER_PASSIVE
-  tone(BUZZER_PIN, BUZZER_FREQ_HZ);
+  tone(BUZZER_PIN, freq);
   delay(ms);
   noTone(BUZZER_PIN);
 #else
@@ -200,6 +213,33 @@ void beep(int ms = BUZZER_MS) {
   delay(ms);
   digitalWrite(BUZZER_PIN, LOW);
 #endif
+}
+
+// ---- [F] Sinais ------------------------------------------
+// Ao ligar: 1 bip + 1 piscada longa -> LED e buzzer OK
+void signalPowerOn() {
+  ledOn();
+  beep(200);
+  delay(300);
+  ledOff();
+}
+
+// PN532 encontrado: 2 bips curtos
+void signalPN532Found() {
+  beep(60); delay(80); beep(60);
+}
+
+// PN532 NAO encontrado: 3 bips graves
+void signalPN532Missing() {
+  for (int i = 0; i < 3; i++) { beep(150, BUZZER_LOW_HZ); delay(120); }
+}
+
+// Cartao lido: bip + piscada
+void signalCardRead() {
+  ledOn();
+  beep(100);
+  delay(100);
+  ledOff();
 }
 
 // [E] Prende o buzzer em LOW antes do deep sleep (sem isso o pino
@@ -582,8 +622,7 @@ void doTapCycle(bool fromCard) {
     if (readCardNow(cardId)) {
       Serial.printf("Card: %s\n", cardId.c_str());
       bufferAddTap(cardId, epochMillis());
-      beep();     // [E] bip = "li seu cartao"
-      blink(40);  // micro pisca = "vi seu cartao"
+      signalCardRead();   // [F] bip + piscada
     } else {
       Serial.println("Acordei mas nao consegui ler cartao");
     }
@@ -663,15 +702,28 @@ void setup() {
   setCpuFrequencyMhz(80);
   btStop();
 
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  bool fromCard = (cause == ESP_SLEEP_WAKEUP_GPIO);
+  bool coldBoot = (cause == ESP_SLEEP_WAKEUP_UNDEFINED);   // ligou ou RESET
+
+  if (coldBoot) {
+    pn532FailCount = 0;
+    signalPowerOn();                  // [F] 1 bip + piscada longa
+  }
+
   if (!initPN532()) {
-    Serial.println("PN532 nao respondeu - dorme 30s e tenta de novo");
+    pn532FailCount++;
+    signalPN532Missing();             // [F] 3 bips graves
+    uint64_t retryS = (pn532FailCount <= PN532_FAST_RETRIES) ? 3 : 30;
+    Serial.printf("PN532 nao respondeu (%u) - tenta de novo em %llus\n",
+                  pn532FailCount, (unsigned long long)retryS);
     buzzerHoldForSleep();   // [E]
-    esp_sleep_enable_timer_wakeup(30ULL * 1000000ULL);
+    esp_sleep_enable_timer_wakeup(retryS * 1000000ULL);
     esp_deep_sleep_start();
   }
 
-  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-  bool fromCard = (cause == ESP_SLEEP_WAKEUP_GPIO);
+  if (coldBoot || pn532FailCount > 0) signalPN532Found();   // [F] 2 bips curtos
+  pn532FailCount = 0;
 
   Serial.printf("\n=== Boot #%u cause=%d ===\n", bootCount, cause);
 
@@ -732,7 +784,7 @@ void loop() {
   if (readCardNow(c)) {
     Serial.printf("[DEBUG] Cartao lido: %s -> bufferizando e publicando\n", c.c_str());
     bufferAddTap(c, epochMillis());
-    beep();   // [E]
+    signalCardRead();   // [F]
     if (!mqtt.connected()) {
       Serial.println("[DEBUG] MQTT caiu, reconectando...");
       if (WiFi.status() != WL_CONNECTED) connectWifi(15000);
