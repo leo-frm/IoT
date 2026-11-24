@@ -1,7 +1,8 @@
 /*
  * ============================================================
  *  Tap-in / Tap-out -> ThingsBoard (via MQTT)
- *  Hardware: ESP32-C3 Super Mini + PN532 (HSU) + IRQ no GPIO 2
+ *  Hardware: ESP32-C3 Super Mini + PN532 (HSU)
+ *            TX do PN532 -> GPIO 20 (serial) E GPIO 3 (acorda o ESP)
  *
  *  *** VERSAO 4 - MAXIMA EFICIENCIA + SERVIDOR PELO NOME ***
  *  Baseada na ConectabusMaxEfV31. Mudancas:
@@ -39,8 +40,29 @@
  *    Os sinais de "ligou" e "PN532 encontrado" so tocam ao ligar ou
  *    apertar RESET, nao a cada vez que acorda do deep sleep.
  *
+ *   [G] ACORDA PELO TX DO PN532 (GPIO 3), NAO MAIS PELO IRQ
+ *       Teste (TesteIRQ): neste modulo, em HSU, o IRQ NUNCA cai, mas
+ *       a resposta com o UID chega normalmente pela serial. Entao o
+ *       TX do PN532 foi ligado tambem no GPIO 3. A linha serial fica
+ *       em HIGH em repouso; quando o PN532 acha um cartao ele manda
+ *       a resposta e a linha cai -> o ESP acorda (wake por GPIO LOW).
+ *       - Antes de dormir: arma o InAutoPoll, le e descarta o ACK,
+ *         confere se a linha do GPIO 3 ficou em HIGH (com timeout).
+ *         Se nao ficou, nao dorme: re-arma e tenta de novo. Se o
+ *         cartao ja estiver encostado nessa hora, conta o tap ali.
+ *       - GPIO 21 (TX do ESP -> RX do PN532) fica TRAVADO em HIGH no
+ *         deep sleep (gpio_hold). Evita que um glitch na entrada do
+ *         sono cancele o comando pendente e bloqueia o log de boot
+ *         da ROM, que sai pelo GPIO 21 a cada wake. A trava e' solta
+ *         no setup(), antes de iniciar a serial.
+ *       - Ao acordar: a resposta que acordou o ESP se perde durante
+ *         o boot, entao o PN532 e' iniciado de novo e o cartao e'
+ *         lido com readPassiveTargetID (ele ainda esta encostado).
+ *         Se nao ler (wake falso / cartao ja retirado), nao apita:
+ *         so re-arma e dorme. O cartao precisa ficar ~0,5 s encostado.
+ *
  *  Mantido da V31: InAutoPoll (campo RF em duty-cycle), envio em
- *  lote, NTP so quando precisa, wake por IRQ do PN532, 80 MHz.
+ *  lote, NTP so quando precisa, 80 MHz.
  *
  *  Pre-requisito no servidor (Linux) para o nome.local funcionar:
  *      sudo apt install avahi-daemon
@@ -48,7 +70,11 @@
  *
  *  Bibliotecas: PN532 (Elechouse/Seeed: PN532 + PN532_HSU),
  *               PubSubClient. ESPmDNS ja vem no core ESP32.
- *  Fiacao adicional: PN532 IRQ -> ESP GPIO 2
+ *  Ligacao:
+ *    PN532 TX  -> ESP GPIO 20 (RX da serial)  E  ESP GPIO 3 (wake)
+ *    PN532 RX  -> ESP GPIO 21 (TX da serial)
+ *    PN532 IRQ -> nao usado
+ *    Chaves do PN532 em HSU (0 / 0)
  * ============================================================
  */
 
@@ -80,7 +106,7 @@ const char* TAP_TYPE   = "in";            // "in" ou "out"
 const char* NTP_SERVER = "pool.ntp.org";
 
 #define LED_PIN   8     // LED onboard (active LOW)
-#define IRQ_PIN   2     // PN532 IRQ -> aqui
+#define WAKE_PIN  3     // [G] TX do PN532 tambem ligado aqui (acorda o ESP)
 #define PN532_RX  20
 #define PN532_TX  21
 
@@ -108,6 +134,16 @@ const char* NTP_SERVER = "pool.ntp.org";
 // Se o InAutoPoll nao funcionar no seu modulo/fiacao, coloque 1
 // aqui pra cair no modo antigo (varredura continua, sem economia RF):
 #define USE_CONTINUOUS_FALLBACK   0
+
+// ---- [G] Arme do PN532 antes de dormir --------------------
+#define ACK_TIMEOUT_MS            50      // tempo maximo esperando o ACK
+#define RESP_SETTLE_MS            60      // apos o ACK: ve se um cartao ja esta encostado
+#define LINE_IDLE_STABLE_MS       5       // linha do GPIO 3 precisa ficar HIGH por esse tempo...
+#define LINE_IDLE_TIMEOUT_MS      100     // ...dentro desse prazo
+#define ARM_MAX_TRIES             5       // tentativas de armar antes do plano B
+#define ARM_FAIL_SLEEP_S          3       // plano B: dorme so por timer e tenta de novo
+#define CARD_REPEAT_MS            2000    // mesmo cartao de novo dentro disso: nao conta outro tap
+#define CARD_REPEAT_WAIT_MS       400     // espera entre re-armes com o cartao parado no leitor
 
 // ---- Politica de envio em lote ----------------------------
 #define FLUSH_THRESHOLD           10      // sobe WiFi quando juntar N taps
@@ -158,6 +194,8 @@ RTC_DATA_ATTR uint32_t bufferCount     = 0;
 RTC_DATA_ATTR uint64_t lastNtpSyncMs   = 0;
 RTC_DATA_ATTR uint32_t tbIpCache       = 0;   // [A] IP do servidor ja resolvido (0 = nao sei)
 RTC_DATA_ATTR uint32_t pn532FailCount  = 0;   // [F] falhas seguidas do PN532
+RTC_DATA_ATTR char     lastCardId[16]  = "";  // [G] debounce do mesmo cartao
+RTC_DATA_ATTR uint64_t lastCardMs      = 0;
 RTC_DATA_ATTR TapEntry tapBuffer[MAX_BUFFERED_TAPS];
 
 HardwareSerial mySerial(1);
@@ -242,12 +280,32 @@ void signalCardRead() {
   ledOff();
 }
 
-// [E] Prende o buzzer em LOW antes do deep sleep (sem isso o pino
-// pode flutuar e o buzzer apitar/consumir enquanto o ESP dorme).
-void buzzerHoldForSleep() {
+// [E][G] Trava os pinos antes do deep sleep:
+//  - buzzer em LOW (nao apita nem consome dormindo)
+//  - LED apagado
+//  - GPIO 21 (TX do ESP -> RX do PN532) em HIGH: a UART em repouso ja
+//    deixa a linha em HIGH; a trava congela esse nivel durante o sono e
+//    o boot (sem glitch que cancele o comando, sem log da ROM no PN532)
+// Tambem configura o GPIO 3 (wake): entrada sem pull-down.
+void holdPinsForSleep() {
+  mySerial.flush();                    // termina de transmitir -> TX em HIGH
   digitalWrite(BUZZER_PIN, LOW);
+  ledOff();
   gpio_hold_en((gpio_num_t)BUZZER_PIN);
+  gpio_hold_en((gpio_num_t)LED_PIN);
+  gpio_hold_en((gpio_num_t)PN532_TX);
   gpio_deep_sleep_hold_en();
+
+  gpio_pulldown_dis((gpio_num_t)WAKE_PIN);
+  gpio_pullup_en((gpio_num_t)WAKE_PIN);   // o PN532 ja segura a linha; o pull-up so evita flutuar
+}
+
+// [G] Solta as travas. Chamar no inicio do setup(), ANTES de iniciar a serial.
+void releasePinHolds() {
+  gpio_deep_sleep_hold_dis();
+  gpio_hold_dis((gpio_num_t)PN532_TX);
+  gpio_hold_dis((gpio_num_t)BUZZER_PIN);
+  gpio_hold_dis((gpio_num_t)LED_PIN);
 }
 
 String deviceHostname() {
@@ -271,6 +329,24 @@ void bufferAddTap(const String &cardId, uint64_t ts) {
   bufferCount++;
 
   Serial.printf("Buffer: %u tap(s) armazenado(s)\n", bufferCount);
+}
+
+// [G] Registra um tap, com debounce do mesmo cartao (parado no leitor ou
+// encostado duas vezes seguidas). Retorna true se contou como tap novo.
+bool tapAccept(const String &cardId) {
+  uint64_t now = epochMillis();   // o RTC continua contando no deep sleep
+  if (cardId == String(lastCardId) && now - lastCardMs < (uint64_t)CARD_REPEAT_MS) {
+    lastCardMs = now;             // cartao continua ali
+    Serial.printf("Mesmo cartao %s - ignorado\n", cardId.c_str());
+    return false;
+  }
+  strncpy(lastCardId, cardId.c_str(), sizeof(lastCardId) - 1);
+  lastCardId[sizeof(lastCardId) - 1] = '\0';
+  lastCardMs = now;
+  Serial.printf("Card: %s\n", cardId.c_str());
+  bufferAddTap(cardId, now);
+  signalCardRead();               // [F] bip + piscada
+  return true;
 }
 
 // Decide se ja vale a pena gastar uma sessao WiFi.
@@ -333,51 +409,98 @@ void sendPN532Frame(const uint8_t *data, uint8_t len) {
   mySerial.flush();
 }
 
-/*
- * Arma o PN532 em AUTO-POLL: pulsa o campo RF a cada
- * (AUTOPOLL_PERIOD * 150ms); entre os pulsos a antena fica desligada.
- * PollNr=0xFF => varre ate achar cartao; ao achar, baixa a IRQ -> ESP acorda.
- * InAutoPoll: TFI=D4, CMD=0x60, PollNr, Period, Type1
- */
-void armPN532AutoPoll() {
-  uint8_t wake[] = {0x55, 0x55, 0x00, 0x00, 0x00};
-  mySerial.write(wake, sizeof(wake));
-  delay(15);
-  while (mySerial.available()) mySerial.read();
-
-  uint8_t cmd[] = { 0xD4, 0x60, 0xFF, AUTOPOLL_PERIOD, AUTOPOLL_TYPE };
-  sendPN532Frame(cmd, sizeof(cmd));
-  delay(30);
-
-  // Drena o ACK e garante IRQ desasserida (HIGH) antes de dormir.
-  uint32_t t0 = millis();
-  while (millis() - t0 < 60) {
-    while (mySerial.available()) mySerial.read();
-    if (digitalRead(IRQ_PIN) == HIGH) break;
-    delay(2);
+// [G] Extrai o UID de uma resposta do PN532 que chegou pela serial:
+//   D5 61 (InAutoPoll):         NbTg Type Len Tg SENS(2) SEL NFCIDLen UID...
+//   D5 4B (InListPassiveTarget): NbTg Tg SENS(2) SEL NFCIDLen UID...
+bool parseUidFromResponse(const uint8_t *b, int n, String &uidOut) {
+  for (int i = 0; i + 1 < n; i++) {
+    if (b[i] != 0xD5 || (b[i + 1] != 0x61 && b[i + 1] != 0x4B)) continue;
+    bool autopoll = (b[i + 1] == 0x61);
+    int p = i + 2;
+    if (p >= n || b[p++] == 0) return false;   // NbTg = 0
+    if (autopoll) p += 2;                      // Type + Len
+    p += 4;                                    // Tg + SENS_RES(2) + SEL_RES
+    if (p >= n) return false;
+    uint8_t len = b[p++];
+    if (len == 0 || len > 10 || p + len > n) return false;
+    uidOut = uidToString((uint8_t *)&b[p], len);
+    return true;
   }
+  return false;
 }
 
-// Modo antigo (fallback): varredura continua, campo ~100% ligado.
-void armPN532ContinuousScan() {
+enum ArmResult { ARM_IDLE, ARM_CARD, ARM_FAIL };
+
+/*
+ * [G] Arma o PN532 e confere que da pra dormir:
+ *  1. envia InAutoPoll (ou InListPassiveTarget no fallback)
+ *  2. le e descarta o ACK (00 00 FF 00 FF 00)
+ *  3. espera RESP_SETTLE_MS: se chegar resposta, o cartao ja estava
+ *     encostado -> ARM_CARD (com o UID)
+ *  4. confere que a linha do GPIO 3 fica em HIGH -> ARM_IDLE
+ * InAutoPoll: pulsa o campo RF a cada AUTOPOLL_PERIOD*150ms e desliga a
+ * antena entre os pulsos. PollNr=0xFF -> procura ate achar um cartao.
+ */
+ArmResult armPN532(String &cardOut) {
   uint8_t wake[] = {0x55, 0x55, 0x00, 0x00, 0x00};
   mySerial.write(wake, sizeof(wake));
+  mySerial.flush();
   delay(15);
-  nfc.setPassiveActivationRetries(0xFF);
-  delay(20);
   while (mySerial.available()) mySerial.read();
-  uint8_t cmd[] = { 0xD4, 0x4A, 0x01, 0x00 };  // InListPassiveTarget
-  sendPN532Frame(cmd, sizeof(cmd));
-  delay(30);
-  while (mySerial.available()) mySerial.read();
-}
 
-void armPN532() {
 #if USE_CONTINUOUS_FALLBACK
-  armPN532ContinuousScan();
+  uint8_t cmd[] = { 0xD4, 0x4A, 0x01, 0x00 };   // InListPassiveTarget (campo RF continuo)
 #else
-  armPN532AutoPoll();
+  uint8_t cmd[] = { 0xD4, 0x60, 0xFF, AUTOPOLL_PERIOD, AUTOPOLL_TYPE };   // InAutoPoll
 #endif
+  sendPN532Frame(cmd, sizeof(cmd));
+
+  // 2. ACK
+  static const uint8_t ACK_OK[6] = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
+  uint8_t ack[6];
+  int n = 0;
+  uint32_t t0 = millis();
+  while (n < 6 && millis() - t0 < ACK_TIMEOUT_MS) {
+    if (mySerial.available()) ack[n++] = (uint8_t)mySerial.read();
+    else delay(1);
+  }
+  if (n < 6 || memcmp(ack, ACK_OK, 6) != 0) {
+    Serial.printf("Arme: ACK invalido (%d bytes)\n", n);
+    return ARM_FAIL;
+  }
+
+  // 3. Cartao ja encostado?
+  uint8_t resp[64];
+  int rlen = 0;
+  uint32_t lastByte = 0;
+  t0 = millis();
+  while ((millis() - t0 < RESP_SETTLE_MS) || (rlen > 0 && millis() - lastByte < 20)) {
+    while (mySerial.available()) {
+      int b = mySerial.read();
+      if (rlen < (int)sizeof(resp)) resp[rlen++] = (uint8_t)b;
+      lastByte = millis();
+    }
+    if (millis() - t0 > 300) break;   // seguranca
+    delay(1);
+  }
+  if (rlen > 0) {
+    if (parseUidFromResponse(resp, rlen, cardOut)) return ARM_CARD;
+    Serial.printf("Arme: %d byte(s) inesperados apos o ACK\n", rlen);
+    return ARM_FAIL;
+  }
+
+  // 4. Linha do GPIO 3 em repouso (HIGH) por LINE_IDLE_STABLE_MS
+  t0 = millis();
+  uint32_t highSince = millis();
+  while (true) {
+    if (digitalRead(WAKE_PIN) == LOW || mySerial.available()) highSince = millis();
+    if (millis() - highSince >= LINE_IDLE_STABLE_MS) return ARM_IDLE;
+    if (millis() - t0 > LINE_IDLE_TIMEOUT_MS) {
+      Serial.println("Arme: linha do GPIO 3 nao ficou em HIGH");
+      return ARM_FAIL;
+    }
+    delayMicroseconds(200);
+  }
 }
 
 // ============= NETWORK ===============
@@ -618,13 +741,13 @@ void doFlushSession() {
 
 void doTapCycle(bool fromCard) {
   if (fromCard) {
+    // [G] A resposta que acordou o ESP se perdeu no boot (initPN532 ja
+    // descartou o que chegou). Le de novo: o cartao ainda esta encostado.
     String cardId;
     if (readCardNow(cardId)) {
-      Serial.printf("Card: %s\n", cardId.c_str());
-      bufferAddTap(cardId, epochMillis());
-      signalCardRead();   // [F] bip + piscada
+      tapAccept(cardId);   // bip + piscada so se for tap novo
     } else {
-      Serial.println("Acordei mas nao consegui ler cartao");
+      Serial.println("Acordei pelo GPIO 3 mas nao li cartao (wake falso ou cartao retirado)");
     }
   }
 
@@ -651,9 +774,8 @@ uint64_t computeTimerSleepS() {
 }
 
 void armAndSleep() {
-  armPN532();
-
 #if DEBUG_KEEP_AWAKE
+  // Em debug o loop() le o cartao direto; nao arma o InAutoPoll.
   Serial.println("\n[DEBUG] KEEP_AWAKE ligado: NAO vou dormir.");
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[DEBUG] Testando WiFi...");
@@ -670,18 +792,55 @@ void armAndSleep() {
   return;
 #endif
 
-  uint64_t timerS = computeTimerSleepS();
-  Serial.printf("Deep sleep. Boots=%u Sent=%u Buffer=%u TimerWake=%llus\n",
-                bootCount, tapsTotalSent, bufferCount,
-                (unsigned long long)timerS);
-  Serial.flush();
+  while (true) {
+    // [G] Arma o PN532 ate a linha do GPIO 3 ficar em repouso
+    bool ready = false;
+    for (int tries = 0; tries < ARM_MAX_TRIES; tries++) {
+      String card;
+      ArmResult r = armPN532(card);
+      if (r == ARM_IDLE) { ready = true; break; }
+      if (r == ARM_CARD) {
+        Serial.println("Cartao ja estava encostado ao armar");
+        if (tapAccept(card)) {
+          if (shouldFlushNow()) doFlushSession();
+        } else {
+          delay(CARD_REPEAT_WAIT_MS);   // mesmo cartao parado: espera ser retirado
+        }
+      } else {
+        delay(50);
+      }
+    }
 
-  buzzerHoldForSleep();   // [E]
+    // Ultima checagem: se chegou algo enquanto preparava, nao dorme ainda
+    if (ready && mySerial.available()) {
+      Serial.println("Chegaram bytes logo antes de dormir - re-armando");
+      continue;
+    }
 
-  // Wake on IRQ baixando (PN532 IRQ active LOW) - detectou cartao
-  esp_deep_sleep_enable_gpio_wakeup(BIT(IRQ_PIN), ESP_GPIO_WAKEUP_GPIO_LOW);
-  esp_sleep_enable_timer_wakeup(timerS * 1000000ULL);
-  esp_deep_sleep_start();
+    uint64_t timerS;
+    if (ready) {
+      timerS = computeTimerSleepS();
+      Serial.printf("Deep sleep. Boots=%u Sent=%u Buffer=%u TimerWake=%llus\n",
+                    bootCount, tapsTotalSent, bufferCount,
+                    (unsigned long long)timerS);
+    } else {
+      // Plano B: nao deu pra deixar a linha em repouso (cartao parado no
+      // leitor, PN532 respondendo errado...). Dorme so por timer e tenta de novo.
+      timerS = ARM_FAIL_SLEEP_S;
+      Serial.printf("Nao consegui armar o PN532 - dormindo so por timer (%llus)\n",
+                    (unsigned long long)timerS);
+    }
+    Serial.flush();
+
+    holdPinsForSleep();   // [E][G] buzzer LOW, LED apagado, GPIO 21 HIGH
+
+    if (ready) {
+      // [G] Acorda quando o TX do PN532 (GPIO 3) cair = resposta com cartao
+      esp_deep_sleep_enable_gpio_wakeup(BIT(WAKE_PIN), ESP_GPIO_WAKEUP_GPIO_LOW);
+    }
+    esp_sleep_enable_timer_wakeup(timerS * 1000000ULL);
+    esp_deep_sleep_start();
+  }
 }
 
 // ============= MAIN ===============
@@ -691,13 +850,14 @@ void setup() {
   delay(300);
   bootCount++;
 
+  releasePinHolds();                // [G] solta GPIO 21/buzzer/LED ANTES da serial
+
   pinMode(LED_PIN, OUTPUT);
   ledOff();
-  pinMode(IRQ_PIN, INPUT_PULLUP);
-
-  gpio_hold_dis((gpio_num_t)BUZZER_PIN);   // [E] solta o pino travado no sleep
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
+  pinMode(WAKE_PIN, INPUT);         // [G] sem pull-down: o PN532 segura a linha
+  gpio_pulldown_dis((gpio_num_t)WAKE_PIN);
 
   setCpuFrequencyMhz(80);
   btStop();
@@ -717,7 +877,7 @@ void setup() {
     uint64_t retryS = (pn532FailCount <= PN532_FAST_RETRIES) ? 3 : 30;
     Serial.printf("PN532 nao respondeu (%u) - tenta de novo em %llus\n",
                   pn532FailCount, (unsigned long long)retryS);
-    buzzerHoldForSleep();   // [E]
+    holdPinsForSleep();     // [E][G]
     esp_sleep_enable_timer_wakeup(retryS * 1000000ULL);
     esp_deep_sleep_start();
   }
@@ -782,9 +942,8 @@ void loop() {
 
   String c;
   if (readCardNow(c)) {
-    Serial.printf("[DEBUG] Cartao lido: %s -> bufferizando e publicando\n", c.c_str());
-    bufferAddTap(c, epochMillis());
-    signalCardRead();   // [F]
+    if (!tapAccept(c)) return;   // mesmo cartao parado no leitor
+    Serial.printf("[DEBUG] Cartao lido: %s -> publicando\n", c.c_str());
     if (!mqtt.connected()) {
       Serial.println("[DEBUG] MQTT caiu, reconectando...");
       if (WiFi.status() != WL_CONNECTED) connectWifi(15000);
